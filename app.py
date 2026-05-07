@@ -199,17 +199,19 @@ def map_departments(unique_values: list[str], api_key: str, model: str):
         f"{i + 1}. {v!r}" for i, v in enumerate(unique_values)
     )
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=16000,
-        thinking={"type": "adaptive"},
-        output_config={
-            "effort": "high",
-            "format": {"type": "json_schema", "schema": schema},
-        },
-        system=build_system_prompt(),
-        messages=[{"role": "user", "content": user_msg}],
-    )
+    kwargs = {
+        "model": model,
+        "max_tokens": 16000,
+        "system": build_system_prompt(),
+        "messages": [{"role": "user", "content": user_msg}],
+        "output_config": {"format": {"type": "json_schema", "schema": schema}},
+    }
+    # Adaptive thinking + effort are supported on Opus/Sonnet but error on Haiku 4.5.
+    if model.startswith(("claude-opus", "claude-sonnet")):
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"]["effort"] = "high"
+
+    response = client.messages.create(**kwargs)
 
     text = next(b.text for b in response.content if b.type == "text")
     data = json.loads(text)
@@ -224,19 +226,21 @@ def main():
         f"`{DEPT_COLUMN}` column to the canonical UofT department list and returns an Excel file."
     )
 
+    api_key = ""
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
     with st.sidebar:
         st.header("Settings")
-        api_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            value=os.environ.get("ANTHROPIC_API_KEY", ""),
-            help="Or set ANTHROPIC_API_KEY in your environment.",
-        )
         model = st.selectbox(
             "Model",
-            ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+            ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"],
             index=0,
-            help="Opus 4.7 gives the best reasoning on tricky abbreviations; Haiku is cheapest.",
+            help="Haiku is cheapest and handles this task well; Opus is most accurate on tricky abbreviations.",
         )
 
     uploaded = st.file_uploader("Upload survey CSV", type=["csv"])
@@ -266,7 +270,10 @@ def main():
         st.write(unique_vals)
 
     if not api_key:
-        st.warning("Enter an Anthropic API key in the sidebar to proceed.")
+        st.error(
+            "Server is missing the ANTHROPIC_API_KEY secret. "
+            "The app owner needs to set it in Streamlit Cloud → Settings → Secrets."
+        )
         return
 
     if not st.button("Standardize and download Excel", type="primary"):
