@@ -222,7 +222,7 @@ def main():
     st.set_page_config(page_title="UofT Department Standardizer", layout="wide")
     st.title("UofT Department Standardizer")
     st.caption(
-        "Upload a Bargaining Survey CSV. Claude maps every entry in the "
+        "Upload a Bargaining Survey CSV. The app maps every entry in the "
         f"`{DEPT_COLUMN}` column to the canonical UofT department list and returns an Excel file."
     )
 
@@ -234,13 +234,25 @@ def main():
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
+    POWER_OPTIONS = {
+        "Lower Power": "claude-haiku-4-5",
+        "Medium Power": "claude-sonnet-4-6",
+        "Higher Power": "claude-opus-4-7",
+    }
+
     with st.sidebar:
         st.header("Settings")
-        model = st.selectbox(
-            "Model",
-            ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"],
+        power_label = st.selectbox(
+            "Power Level",
+            list(POWER_OPTIONS.keys()),
             index=0,
-            help="Haiku is cheapest and handles this task well; Opus is most accurate on tricky abbreviations.",
+            help="Lower Power is cheapest and handles this task well; Higher Power is most accurate on tricky abbreviations.",
+        )
+        model = POWER_OPTIONS[power_label]
+        st.info(
+            "Disclaimer: the Higher Power costs some money, however for the final "
+            "analysis where the data will get larger it will be needed. For now, "
+            "lower powers work fine."
         )
 
     uploaded = st.file_uploader("Upload survey CSV", type=["csv"])
@@ -279,7 +291,7 @@ def main():
     if not st.button("Standardize and download Excel", type="primary"):
         return
 
-    with st.spinner(f"Mapping with {model}..."):
+    with st.spinner(f"Mapping with {power_label}..."):
         try:
             mappings, usage = map_departments(unique_vals, api_key, model)
         except anthropic.APIError as e:
