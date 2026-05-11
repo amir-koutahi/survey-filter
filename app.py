@@ -157,14 +157,16 @@ CANONICAL LIST (the only valid match values):
 {canonical_block}
 
 Rules:
-- Output the `match` field as one of the canonical strings above, byte-for-byte. Copy exactly — punctuation, ampersands, capitalization, and abbreviations must match the list.
-- Fix typos: "Physcs" -> "Department of Physics", "Depatment of Mathematics" -> "Department of Mathematics".
-- Expand abbreviations using UofT context: "ECE" -> "Department of Electrical & Computer Engineering", "NMC" -> "Department of Near & Middle East.Civilizations", "Astro" -> "Department of Astronomy and Astrophysics".
-- Match partial names: "Math" / "mathematics" -> "Department of Mathematics"; "Spanish" / "Italian, Spanish, Portuguese, & Latin American Studies" -> "Department of Italian, Spanish, Portuguese & Latin American Studies"; "Cinema Studies" -> "Cinema Studies Institute"; "History" -> "Department of History".
-- For UTM-prefixed inputs, use the corresponding "UTM:" entry. For UTSC-prefixed inputs, use the corresponding "UTSC:" entry. "UNIVERSITY OF TORONTO MISSISSAUGA - COMPUTER SCIENCE" — UTM has no separate CS department; map to "UTM: Mathematical & Computational Sciences".
-- "FAS" (Faculty of Arts and Science) is a faculty, not a department in the list — set match to the original input and confidence to "none".
-- "null", empty-looking, or genuinely unmatchable values: set match to the original input and confidence to "none".
-- Do not invent canonical entries. If nothing fits, return the original input verbatim with confidence "none"."""
+- Output the `matches` field as an array of canonical strings above, byte-for-byte. Copy exactly — punctuation, ampersands, capitalization, and abbreviations must match the list.
+- If the input clearly references TWO OR MORE distinct departments (e.g., "Math and Stats", "Physics / Astronomy", "ECE & MIE"), return ALL of them in the `matches` array. Otherwise return a single-element array.
+- Fix typos: "Physcs" -> ["Department of Physics"], "Depatment of Mathematics" -> ["Department of Mathematics"].
+- Expand abbreviations using UofT context: "ECE" -> ["Department of Electrical & Computer Engineering"], "NMC" -> ["Department of Near & Middle East.Civilizations"], "Astro" -> ["Department of Astronomy and Astrophysics"].
+- Match partial names: "Math" / "mathematics" -> ["Department of Mathematics"]; "Spanish" -> ["Department of Italian, Spanish, Portuguese & Latin American Studies"]; "Cinema Studies" -> ["Cinema Studies Institute"]; "History" -> ["Department of History"].
+- Multi-department examples: "Math and Stats" -> ["Department of Mathematics", "Department of Statistical Sciences"]; "Physics/Astronomy" -> ["Department of Physics", "Department of Astronomy and Astrophysics"].
+- For UTM-prefixed inputs, use the corresponding "UTM:" entry. For UTSC-prefixed inputs, use the corresponding "UTSC:" entry. "UNIVERSITY OF TORONTO MISSISSAUGA - COMPUTER SCIENCE" — UTM has no separate CS department; map to ["UTM: Mathematical & Computational Sciences"].
+- "FAS" (Faculty of Arts and Science) is a faculty, not a department in the list — set `matches` to [original input] and confidence to "none".
+- "null", empty-looking, or genuinely unmatchable values: set `matches` to [original input] and confidence to "none".
+- Do not invent canonical entries. If nothing fits, return [original input verbatim] with confidence "none"."""
 
 
 def map_departments(unique_values: list[str], api_key: str, model: str):
@@ -179,14 +181,18 @@ def map_departments(unique_values: list[str], api_key: str, model: str):
                     "type": "object",
                     "properties": {
                         "input": {"type": "string"},
-                        "match": {"type": "string"},
+                        "matches": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
                         "confidence": {
                             "type": "string",
                             "enum": ["high", "medium", "low", "none"],
                         },
                         "reasoning": {"type": "string"},
                     },
-                    "required": ["input", "match", "confidence", "reasoning"],
+                    "required": ["input", "matches", "confidence", "reasoning"],
                     "additionalProperties": False,
                 },
             }
@@ -301,28 +307,44 @@ def main():
             st.error(f"Unexpected error: {e}")
             return
 
-    mapping_dict = {m["input"]: m["match"] for m in mappings}
-    confidence_dict = {m["input"]: m["confidence"] for m in mappings}
-
-    invalid = [
-        m["match"]
+    invalid = sorted({
+        x
         for m in mappings
-        if m["confidence"] != "none" and m["match"] not in CANONICAL_SET
-    ]
+        if m["confidence"] != "none"
+        for x in m["matches"]
+        if x not in CANONICAL_SET
+    })
     if invalid:
         st.warning(
             "Model returned values that don't byte-match the canonical list "
-            "(treated as 'none'): " + ", ".join(sorted(set(invalid)))
+            "(treated as 'none'): " + ", ".join(invalid)
         )
         for m in mappings:
-            if m["match"] not in CANONICAL_SET and m["confidence"] != "none":
+            if m["confidence"] != "none" and any(x not in CANONICAL_SET for x in m["matches"]):
                 m["confidence"] = "none"
-                mapping_dict[m["input"]] = m["input"]
-                confidence_dict[m["input"]] = "none"
+                m["matches"] = [m["input"]]
 
-    preview_df = pd.DataFrame(mappings)
+    mapping_dict = {m["input"]: "; ".join(m["matches"]) for m in mappings}
+    confidence_dict = {m["input"]: m["confidence"] for m in mappings}
+
+    preview_df = pd.DataFrame(
+        [
+            {
+                "input": m["input"],
+                "match": "; ".join(m["matches"]),
+                "num_matches": len(m["matches"]),
+                "confidence": m["confidence"],
+                "reasoning": m["reasoning"],
+            }
+            for m in mappings
+        ]
+    )
     st.subheader("Mapping preview")
     st.dataframe(preview_df, width="stretch")
+
+    multi = preview_df[preview_df["num_matches"] > 1]
+    if not multi.empty:
+        st.info(f"{len(multi)} input(s) mapped to multiple departments (joined with `; `).")
 
     counts = preview_df["confidence"].value_counts().to_dict()
     cols = st.columns(4)
