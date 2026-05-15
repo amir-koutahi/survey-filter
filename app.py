@@ -324,14 +324,18 @@ def main():
                 m["confidence"] = "none"
                 m["matches"] = [m["input"]]
 
-    mapping_dict = {m["input"]: "; ".join(m["matches"]) for m in mappings}
+    primary_dict = {m["input"]: m["matches"][0] for m in mappings}
+    secondary_dict = {
+        m["input"]: "; ".join(m["matches"][1:]) for m in mappings
+    }
     confidence_dict = {m["input"]: m["confidence"] for m in mappings}
 
     preview_df = pd.DataFrame(
         [
             {
                 "input": m["input"],
-                "match": "; ".join(m["matches"]),
+                "match": m["matches"][0],
+                "second match": "; ".join(m["matches"][1:]),
                 "num_matches": len(m["matches"]),
                 "confidence": m["confidence"],
                 "reasoning": m["reasoning"],
@@ -344,7 +348,7 @@ def main():
 
     multi = preview_df[preview_df["num_matches"] > 1]
     if not multi.empty:
-        st.info(f"{len(multi)} input(s) mapped to multiple departments (joined with `; `).")
+        st.info(f"{len(multi)} input(s) mapped to multiple departments (second match goes in its own column).")
 
     counts = preview_df["confidence"].value_counts().to_dict()
     cols = st.columns(4)
@@ -358,19 +362,19 @@ def main():
         f"output: {usage.output_tokens:,}"
     )
 
-    def replace(v):
+    def lookup(d, v, default=""):
         if pd.isna(v):
-            return v
-        key = str(v).strip()
-        return mapping_dict.get(key, v)
+            return v if d is primary_dict else default
+        return d.get(str(v).strip(), v if d is primary_dict else default)
 
     df_out = df.copy()
-    df_out[DEPT_COLUMN] = df_out[DEPT_COLUMN].apply(replace)
+    df_out[DEPT_COLUMN] = df_out[DEPT_COLUMN].apply(lambda v: lookup(primary_dict, v))
+
+    second_match_col = f"{DEPT_COLUMN} (second match)"
+    df_out[second_match_col] = df[DEPT_COLUMN].apply(lambda v: lookup(secondary_dict, v))
 
     confidence_col = f"{DEPT_COLUMN} (match confidence)"
-    df_out[confidence_col] = df[DEPT_COLUMN].apply(
-        lambda v: confidence_dict.get(str(v).strip(), "") if pd.notna(v) else ""
-    )
+    df_out[confidence_col] = df[DEPT_COLUMN].apply(lambda v: lookup(confidence_dict, v))
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
