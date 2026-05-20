@@ -428,7 +428,7 @@ def run_department_standardization(api_key: str, model: str, power_label: str):
 
 
 def run_steward_audit(api_key: str, model: str, power_label: str):
-    st.subheader("Steward survey audit")
+    st.subheader("Stewards didnt complete survey")
     st.caption(
         "Upload the steward list and the survey CSV. The app returns an Excel "
         "of stewards who have NOT completed the survey."
@@ -506,7 +506,7 @@ def run_steward_audit(api_key: str, model: str, power_label: str):
         s["idx"] for s in stewards
         if s["email"] and s["email"] not in placeholder_emails and s["email"] in resp_emails
     }
-    st.info(f"{len(email_matched)} stewards matched by exact email; using AI to check the rest by name.")
+    st.info(f"{len(email_matched)} stewards matched by exact email; checking the rest by name.")
 
     remaining = [s for s in stewards if s["idx"] not in email_matched]
 
@@ -599,7 +599,7 @@ def main():
         st.header("Settings")
         mode = st.radio(
             "Mode",
-            ["Department Standardization", "Steward Survey Audit"],
+            ["Department Standardization", "Stewards didnt complete survey"],
             index=0,
         )
         power_label = st.selectbox(
