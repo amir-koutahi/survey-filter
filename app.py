@@ -224,44 +224,79 @@ def map_departments(unique_values: list[str], api_key: str, model: str):
     return data["mappings"], response.usage
 
 
-def main():
-    st.set_page_config(page_title="UofT Department Standardizer", layout="wide")
-    st.title("UofT Department Standardizer")
+def match_stewards_to_respondents(stewards, respondents, api_key: str, model: str):
+    client = anthropic.Anthropic(api_key=api_key)
+
+    system = (
+        "You match union stewards against survey respondents to determine which "
+        "stewards have completed the survey.\n\n"
+        "Match on name (allowing typos, nicknames, middle-name variations, "
+        "transliteration differences) and email (case-insensitive). "
+        "Email exact match is the strongest signal; a confident name match also counts.\n\n"
+        "For each steward, return whether they have a matching respondent."
+    )
+
+    stewards_block = "\n".join(
+        f"S{s['idx']}: {s['first']} {s['last']} <{s['email']}>" for s in stewards
+    )
+    respondents_block = "\n".join(
+        f"R{r['idx']}: {r['first']} {r['last']} <{r['email']}>" for r in respondents
+    )
+    user_msg = (
+        f"STEWARDS:\n{stewards_block}\n\nSURVEY RESPONDENTS:\n{respondents_block}\n\n"
+        "For each steward, determine whether any respondent is plausibly the same person."
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "matches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "steward_idx": {"type": "integer"},
+                        "matched": {"type": "boolean"},
+                        "respondent_idx": {"type": ["integer", "null"]},
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low", "none"],
+                        },
+                    },
+                    "required": ["steward_idx", "matched", "respondent_idx", "confidence"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["matches"],
+        "additionalProperties": False,
+    }
+
+    kwargs = {
+        "model": model,
+        "max_tokens": 16000,
+        "system": system,
+        "messages": [{"role": "user", "content": user_msg}],
+        "output_config": {"format": {"type": "json_schema", "schema": schema}},
+    }
+    if model.startswith(("claude-opus", "claude-sonnet")):
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"]["effort"] = "high"
+
+    response = client.messages.create(**kwargs)
+    text = next(b.text for b in response.content if b.type == "text")
+    data = json.loads(text)
+    return data["matches"], response.usage
+
+
+def run_department_standardization(api_key: str, model: str, power_label: str):
+    st.subheader("Department standardization")
     st.caption(
         "Upload a Bargaining Survey CSV. The app maps every entry in the "
         f"`{DEPT_COLUMN}` column to the canonical UofT department list and returns an Excel file."
     )
 
-    api_key = ""
-    try:
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    except Exception:
-        pass
-    if not api_key:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-    POWER_OPTIONS = {
-        "Lower Power": "claude-haiku-4-5",
-        "Medium Power": "claude-sonnet-4-6",
-        "Higher Power": "claude-opus-4-7",
-    }
-
-    with st.sidebar:
-        st.header("Settings")
-        power_label = st.selectbox(
-            "Power Level",
-            list(POWER_OPTIONS.keys()),
-            index=0,
-            help="Lower Power is cheapest and handles this task well; Higher Power is most accurate on tricky abbreviations.",
-        )
-        model = POWER_OPTIONS[power_label]
-        st.info(
-            "Disclaimer: the Higher Power costs some money, however for the final "
-            "analysis where the data will get larger it will be needed. For now, "
-            "lower powers work fine."
-        )
-
-    uploaded = st.file_uploader("Upload survey CSV", type=["csv"])
+    uploaded = st.file_uploader("Upload survey CSV", type=["csv"], key="dept_survey")
     if not uploaded:
         return
 
@@ -390,6 +425,200 @@ def main():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
+
+
+def run_steward_audit(api_key: str, model: str, power_label: str):
+    st.subheader("Steward survey audit")
+    st.caption(
+        "Upload the steward list and the survey CSV. The app returns an Excel "
+        "of stewards who have NOT completed the survey."
+    )
+
+    col_a, col_b = st.columns(2)
+    stewards_file = col_a.file_uploader("Steward list CSV", type=["csv"], key="audit_stewards")
+    survey_file = col_b.file_uploader("Survey CSV", type=["csv"], key="audit_survey")
+    if not stewards_file or not survey_file:
+        return
+
+    try:
+        stewards_df = pd.read_csv(stewards_file)
+    except Exception as e:
+        st.error(f"Could not read steward CSV: {e}")
+        return
+    try:
+        survey_df = pd.read_csv(survey_file)
+    except Exception as e:
+        st.error(f"Could not read survey CSV: {e}")
+        return
+
+    steward_first = "First Name"
+    steward_last = "Last Name"
+    steward_email = "Top Ranked Email"
+    for col in (steward_first, steward_last, steward_email):
+        if col not in stewards_df.columns:
+            st.error(f"Steward CSV is missing the `{col}` column.")
+            return
+
+    survey_first = "Name"
+    survey_last = "Last"
+    survey_email = "Email"
+    for col in (survey_first, survey_last, survey_email):
+        if col not in survey_df.columns:
+            st.error(f"Survey CSV is missing the `{col}` column.")
+            return
+
+    def norm_email(v):
+        if pd.isna(v):
+            return ""
+        return str(v).strip().lower()
+
+    def norm_str(v):
+        if pd.isna(v):
+            return ""
+        return str(v).strip()
+
+    stewards = []
+    for i, row in stewards_df.iterrows():
+        stewards.append({
+            "idx": int(i),
+            "first": norm_str(row[steward_first]),
+            "last": norm_str(row[steward_last]),
+            "email": norm_email(row[steward_email]),
+        })
+
+    respondents = []
+    for i, row in survey_df.iterrows():
+        respondents.append({
+            "idx": int(i),
+            "first": norm_str(row[survey_first]),
+            "last": norm_str(row[survey_last]),
+            "email": norm_email(row[survey_email]),
+        })
+
+    st.success(
+        f"Loaded {len(stewards):,} stewards and {len(respondents):,} survey respondents."
+    )
+
+    placeholder_emails = {"", "null@null.com"}
+    resp_emails = {r["email"] for r in respondents if r["email"] not in placeholder_emails}
+
+    email_matched = {
+        s["idx"] for s in stewards
+        if s["email"] and s["email"] not in placeholder_emails and s["email"] in resp_emails
+    }
+    st.info(f"{len(email_matched)} stewards matched by exact email; using AI to check the rest by name.")
+
+    remaining = [s for s in stewards if s["idx"] not in email_matched]
+
+    if not api_key:
+        st.error(
+            "Server is missing the ANTHROPIC_API_KEY secret. "
+            "The app owner needs to set it in Streamlit Cloud → Settings → Secrets."
+        )
+        return
+
+    if not st.button("Run audit and download Excel", type="primary"):
+        return
+
+    ai_matched = set()
+    usage = None
+    if remaining:
+        with st.spinner(f"Matching remaining stewards with {power_label}..."):
+            try:
+                results, usage = match_stewards_to_respondents(
+                    remaining, respondents, api_key, model
+                )
+            except anthropic.APIError as e:
+                st.error(f"Anthropic API error: {e}")
+                return
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+                return
+        ai_matched = {
+            r["steward_idx"] for r in results
+            if r["matched"] and r["confidence"] in ("high", "medium")
+        }
+
+    matched_idx = email_matched | ai_matched
+    missing_mask = ~stewards_df.index.isin(matched_idx)
+    missing_df = stewards_df.loc[missing_mask].copy()
+
+    cols = st.columns(3)
+    cols[0].metric("Total stewards", len(stewards))
+    cols[1].metric("Completed survey", len(matched_idx))
+    cols[2].metric("Missing", len(missing_df))
+
+    if usage is not None:
+        st.caption(
+            f"Tokens — input: {usage.input_tokens:,}, output: {usage.output_tokens:,}"
+        )
+
+    output_cols = [c for c in (
+        steward_first, steward_last, steward_email,
+        "CUPE No.", "Position Entity", "Division Name", "Unit Name",
+    ) if c in missing_df.columns]
+    preview_df = missing_df[output_cols] if output_cols else missing_df
+
+    st.subheader("Stewards who have not completed the survey")
+    st.dataframe(preview_df, width="stretch")
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        preview_df.to_excel(writer, index=False, sheet_name="Missing Stewards")
+    buf.seek(0)
+
+    base = stewards_file.name.rsplit(".", 1)[0]
+    st.download_button(
+        "Download missing-stewards Excel",
+        data=buf,
+        file_name=f"{base}-missing-survey.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+
+def main():
+    st.set_page_config(page_title="UofT Bargaining Tools", layout="wide")
+    st.title("UofT Bargaining Tools")
+
+    api_key = ""
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    POWER_OPTIONS = {
+        "Lower Power": "claude-haiku-4-5",
+        "Medium Power": "claude-sonnet-4-6",
+        "Higher Power": "claude-opus-4-7",
+    }
+
+    with st.sidebar:
+        st.header("Settings")
+        mode = st.radio(
+            "Mode",
+            ["Department Standardization", "Steward Survey Audit"],
+            index=0,
+        )
+        power_label = st.selectbox(
+            "Power Level",
+            list(POWER_OPTIONS.keys()),
+            index=0,
+            help="Lower Power is cheapest and handles this task well; Higher Power is most accurate on tricky cases.",
+        )
+        model = POWER_OPTIONS[power_label]
+        st.info(
+            "Disclaimer: the Higher Power costs some money, however for the final "
+            "analysis where the data will get larger it will be needed. For now, "
+            "lower powers work fine."
+        )
+
+    if mode == "Department Standardization":
+        run_department_standardization(api_key, model, power_label)
+    else:
+        run_steward_audit(api_key, model, power_label)
 
 
 if __name__ == "__main__":
