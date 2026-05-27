@@ -577,6 +577,95 @@ def run_steward_audit(api_key: str, model: str, power_label: str):
     )
 
 
+def run_dedupe_by_name():
+    st.subheader("Deduplicate by Name")
+    st.caption(
+        "Upload a survey file (CSV or Excel). Rows with matching first + last name "
+        "are deduplicated to the first occurrence — comparison ignores capitalization "
+        "and whitespace. The removed duplicates are returned as a separate Excel file."
+    )
+
+    uploaded = st.file_uploader(
+        "Upload survey file", type=["csv", "xlsx"], key="dedupe_survey"
+    )
+    if not uploaded:
+        return
+
+    try:
+        if uploaded.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded)
+        else:
+            df = pd.read_excel(uploaded)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        return
+
+    first_col = "Name"
+    last_col = "Last"
+    for col in (first_col, last_col):
+        if col not in df.columns:
+            st.error(f"File is missing the `{col}` column.")
+            return
+
+    st.success(f"Loaded {len(df):,} rows.")
+
+    def norm(v):
+        if pd.isna(v):
+            return ""
+        return "".join(str(v).split()).lower()
+
+    first_norm = df[first_col].apply(norm)
+    last_norm = df[last_col].apply(norm)
+    key = first_norm + "|" + last_norm
+    has_name = (first_norm != "") | (last_norm != "")
+
+    duplicate_mask = has_name & key.duplicated(keep="first")
+
+    kept_df = df.loc[~duplicate_mask].copy()
+    removed_df = df.loc[duplicate_mask].copy()
+
+    cols = st.columns(3)
+    cols[0].metric("Total rows", len(df))
+    cols[1].metric("Kept (deduplicated)", len(kept_df))
+    cols[2].metric("Removed duplicates", len(removed_df))
+
+    if not removed_df.empty:
+        st.subheader("Removed duplicate rows")
+        front = [first_col, last_col]
+        ordered = front + [c for c in removed_df.columns if c not in front]
+        st.dataframe(removed_df[ordered], width="stretch")
+    else:
+        st.info("No duplicate names found.")
+
+    base = uploaded.name.rsplit(".", 1)[0]
+
+    kept_buf = io.BytesIO()
+    with pd.ExcelWriter(kept_buf, engine="openpyxl") as writer:
+        kept_df.to_excel(writer, index=False, sheet_name="Deduplicated")
+    kept_buf.seek(0)
+
+    removed_buf = io.BytesIO()
+    with pd.ExcelWriter(removed_buf, engine="openpyxl") as writer:
+        removed_df.to_excel(writer, index=False, sheet_name="Removed")
+    removed_buf.seek(0)
+
+    dl_cols = st.columns(2)
+    dl_cols[0].download_button(
+        "Download deduplicated Excel",
+        data=kept_buf,
+        file_name=f"{base}-deduplicated.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    dl_cols[1].download_button(
+        "Download removed-duplicates Excel",
+        data=removed_buf,
+        file_name=f"{base}-removed-duplicates.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=removed_df.empty,
+    )
+
+
 def main():
     st.set_page_config(page_title="UofT Bargaining Tools", layout="wide")
     st.title("UofT Bargaining Tools")
@@ -599,7 +688,11 @@ def main():
         st.header("Settings")
         mode = st.radio(
             "Mode",
-            ["Department Standardization", "Stewards didnt complete survey"],
+            [
+                "Department Standardization",
+                "Stewards didnt complete survey",
+                "Deduplicate by Name",
+            ],
             index=0,
         )
         power_label = st.selectbox(
@@ -617,8 +710,10 @@ def main():
 
     if mode == "Department Standardization":
         run_department_standardization(api_key, model, power_label)
-    else:
+    elif mode == "Stewards didnt complete survey":
         run_steward_audit(api_key, model, power_label)
+    else:
+        run_dedupe_by_name()
 
 
 if __name__ == "__main__":
