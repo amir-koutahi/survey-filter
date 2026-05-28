@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import re
+import zipfile
 
 import anthropic
 import pandas as pd
@@ -666,6 +668,124 @@ def run_dedupe_by_name():
     )
 
 
+def _safe_filename(name: str, fallback: str = "Unknown") -> str:
+    """Strip characters that aren't allowed in filenames on common OSes."""
+    if name is None:
+        return fallback
+    cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]+', " ", str(name)).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.rstrip(". ")
+    return cleaned[:120] if cleaned else fallback
+
+
+def run_group_by_department():
+    st.subheader("Group by Department")
+    st.caption(
+        "Upload a member CSV (e.g. the `2025_09 to present active U1` export). "
+        "The app groups rows by the `Department Name` column and returns a ZIP "
+        "containing one Excel file per department with the full list of members."
+    )
+
+    group_col = "Department Name"
+
+    uploaded = st.file_uploader(
+        "Upload member CSV", type=["csv"], key="group_by_dept_csv"
+    )
+    if not uploaded:
+        return
+
+    raw_bytes = uploaded.getvalue()
+    df = None
+    last_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            df = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc)
+            break
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+            return
+    if df is None:
+        st.error(f"Could not decode CSV: {last_err}")
+        return
+
+    if group_col not in df.columns:
+        st.error(
+            f"CSV is missing the `{group_col}` column. "
+            f"Found columns: {list(df.columns)[:15]}..."
+        )
+        return
+
+    st.success(f"Loaded {len(df):,} rows.")
+
+    dept_series = df[group_col].astype("string").fillna("").str.strip()
+    df = df.assign(**{group_col: dept_series.replace("", pd.NA)})
+
+    blanks = int(df[group_col].isna().sum())
+    if blanks:
+        st.info(
+            f"{blanks} row(s) have an empty `{group_col}`. "
+            f"They will be grouped under `(Unknown)`."
+        )
+    df[group_col] = df[group_col].fillna("(Unknown)")
+
+    groups = list(df.groupby(group_col, sort=True))
+
+    summary_df = pd.DataFrame(
+        [{"Department Name": name, "Members": len(g)} for name, g in groups]
+    )
+
+    cols = st.columns(3)
+    cols[0].metric("Departments", len(groups))
+    cols[1].metric("Total members", len(df))
+    cols[2].metric("Largest group", int(summary_df["Members"].max()) if len(summary_df) else 0)
+
+    st.subheader("Department summary")
+    st.dataframe(summary_df, width="stretch")
+
+    base = uploaded.name.rsplit(".", 1)[0]
+
+    zip_buf = io.BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for dept_name, group_df in groups:
+            safe = _safe_filename(dept_name)
+            # Avoid collisions if two departments sanitize to the same name.
+            candidate = f"{safe}.xlsx"
+            n = 2
+            while candidate in used_names:
+                candidate = f"{safe} ({n}).xlsx"
+                n += 1
+            used_names.add(candidate)
+
+            xbuf = io.BytesIO()
+            with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+                # Excel sheet names must be <= 31 chars and exclude :\\/?*[]
+                sheet_name = re.sub(r"[:\\/?*\[\]]", " ", str(dept_name))[:31] or "Sheet1"
+                group_df.to_excel(writer, index=False, sheet_name=sheet_name)
+            xbuf.seek(0)
+            zf.writestr(candidate, xbuf.getvalue())
+
+        # Include the summary so the recipient knows what's inside.
+        sbuf = io.BytesIO()
+        with pd.ExcelWriter(sbuf, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        sbuf.seek(0)
+        zf.writestr("_summary.xlsx", sbuf.getvalue())
+
+    zip_buf.seek(0)
+
+    st.download_button(
+        "Download departments ZIP",
+        data=zip_buf,
+        file_name=f"{base}-by-department.zip",
+        mime="application/zip",
+        type="primary",
+    )
+
+
 def main():
     st.set_page_config(page_title="UofT Bargaining Tools", layout="wide")
     st.title("UofT Bargaining Tools")
@@ -692,6 +812,7 @@ def main():
                 "Department Standardization",
                 "Stewards didnt complete survey",
                 "Deduplicate by Name",
+                "Group by Department",
             ],
             index=0,
         )
@@ -712,8 +833,10 @@ def main():
         run_department_standardization(api_key, model, power_label)
     elif mode == "Stewards didnt complete survey":
         run_steward_audit(api_key, model, power_label)
-    else:
+    elif mode == "Deduplicate by Name":
         run_dedupe_by_name()
+    else:
+        run_group_by_department()
 
 
 if __name__ == "__main__":
