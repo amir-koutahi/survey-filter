@@ -689,26 +689,17 @@ def run_group_by_department():
     group_col = "Department Name"
 
     uploaded = st.file_uploader(
-        "Upload member CSV", type=["csv"], key="group_by_dept_csv"
+        "Upload member file (CSV or XLSX)",
+        type=["csv", "xlsx", "xls"],
+        key="group_by_dept_csv",
     )
     if not uploaded:
         return
 
-    raw_bytes = uploaded.getvalue()
-    df = None
-    last_err = None
-    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-        try:
-            df = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc)
-            break
-        except UnicodeDecodeError as e:
-            last_err = e
-            continue
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
-            return
-    if df is None:
-        st.error(f"Could not decode CSV: {last_err}")
+    try:
+        df = _read_table(uploaded)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
         return
 
     if group_col not in df.columns:
