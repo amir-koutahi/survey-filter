@@ -787,10 +787,16 @@ def run_group_by_department():
 
 
 def _read_table(uploaded):
-    """Read an uploaded CSV or XLSX file into a DataFrame."""
+    """Read an uploaded CSV or XLSX file into a DataFrame.
+
+    Detects format by magic bytes so files mis-named (e.g. an .xlsx saved
+    with a .csv extension) still load correctly.
+    """
     name = (uploaded.name or "").lower()
     raw = uploaded.getvalue()
-    if name.endswith(".xlsx") or name.endswith(".xls"):
+    # xlsx/xls files are zip archives starting with "PK"; old xls starts with D0 CF 11 E0.
+    looks_xlsx = raw[:2] == b"PK" or raw[:4] == b"\xd0\xcf\x11\xe0"
+    if looks_xlsx or name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(raw))
     last_err = None
     for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
@@ -830,108 +836,44 @@ def run_split_members_by_survey(api_key: str, model: str, power_label: str):
         st.error(f"Could not read survey file: {e}")
         return
 
-    member_first = "First Name"
-    member_last = "Last Name"
     member_email = "Top Ranked Email"
-    for col in (member_first, member_last, member_email):
-        if col not in members_df.columns:
-            st.error(f"Members file is missing the `{col}` column.")
-            return
+    if member_email not in members_df.columns:
+        st.error(f"Members file is missing the `{member_email}` column.")
+        return
 
-    survey_first = "Name"
-    survey_last = "Last"
     survey_email = "Email"
-    for col in (survey_first, survey_last, survey_email):
-        if col not in survey_df.columns:
-            st.error(f"Survey file is missing the `{col}` column.")
-            return
+    if survey_email not in survey_df.columns:
+        st.error(f"Survey file is missing the `{survey_email}` column.")
+        return
 
     def norm_email(v):
         if pd.isna(v):
             return ""
         return str(v).strip().lower()
 
-    def norm_str(v):
-        if pd.isna(v):
-            return ""
-        return str(v).strip()
-
-    members = []
-    for i, row in members_df.iterrows():
-        members.append({
-            "idx": int(i),
-            "first": norm_str(row[member_first]),
-            "last": norm_str(row[member_last]),
-            "email": norm_email(row[member_email]),
-        })
-
-    respondents = []
-    for i, row in survey_df.iterrows():
-        respondents.append({
-            "idx": int(i),
-            "first": norm_str(row[survey_first]),
-            "last": norm_str(row[survey_last]),
-            "email": norm_email(row[survey_email]),
-        })
-
     st.success(
-        f"Loaded {len(members):,} members and {len(respondents):,} survey respondents."
+        f"Loaded {len(members_df):,} members and {len(survey_df):,} survey respondents."
     )
 
     placeholder_emails = {"", "null@null.com"}
-    resp_emails = {r["email"] for r in respondents if r["email"] not in placeholder_emails}
-
-    email_matched = {
-        m["idx"] for m in members
-        if m["email"] and m["email"] not in placeholder_emails and m["email"] in resp_emails
+    resp_emails = {
+        norm_email(v) for v in survey_df[survey_email]
+        if norm_email(v) not in placeholder_emails
     }
-    st.info(f"{len(email_matched)} members matched by exact email; checking the rest by name.")
 
-    remaining = [m for m in members if m["idx"] not in email_matched]
-
-    if not api_key:
-        st.error(
-            "Server is missing the ANTHROPIC_API_KEY secret. "
-            "The app owner needs to set it in Streamlit Cloud → Settings → Secrets."
-        )
-        return
+    member_emails_norm = members_df[member_email].apply(norm_email)
+    completed_mask = member_emails_norm.isin(resp_emails) & ~member_emails_norm.isin(placeholder_emails)
 
     if not st.button("Split and download ZIP", type="primary"):
         return
 
-    ai_matched = set()
-    usage = None
-    if remaining:
-        with st.spinner(f"Matching remaining members with {power_label}..."):
-            try:
-                results, usage = match_stewards_to_respondents(
-                    remaining, respondents, api_key, model
-                )
-            except anthropic.APIError as e:
-                st.error(f"Anthropic API error: {e}")
-                return
-            except Exception as e:
-                st.error(f"Unexpected error: {e}")
-                return
-        ai_matched = {
-            r["steward_idx"] for r in results
-            if r["matched"] and r["confidence"] in ("high", "medium")
-        }
-
-    matched_idx = email_matched | ai_matched
-    completed_mask = members_df.index.isin(matched_idx)
     completed_df = members_df.loc[completed_mask].copy()
     missing_df = members_df.loc[~completed_mask].copy()
 
     cols = st.columns(3)
-    cols[0].metric("Total members", len(members))
+    cols[0].metric("Total members", len(members_df))
     cols[1].metric("Completed survey", len(completed_df))
     cols[2].metric("Did not complete", len(missing_df))
-
-    if usage is not None:
-        st.caption(
-            f"Tokens — input: {usage.input_tokens:,}, output: {usage.output_tokens:,}"
-        )
 
     st.subheader("Members who completed the survey")
     st.dataframe(completed_df, width="stretch")
