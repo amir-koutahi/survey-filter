@@ -786,6 +786,185 @@ def run_group_by_department():
     )
 
 
+def _read_table(uploaded):
+    """Read an uploaded CSV or XLSX file into a DataFrame."""
+    name = (uploaded.name or "").lower()
+    raw = uploaded.getvalue()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(raw))
+    last_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+    raise last_err if last_err else RuntimeError("Could not read file")
+
+
+def run_split_members_by_survey(api_key: str, model: str, power_label: str):
+    st.subheader("Split members by survey completion")
+    st.caption(
+        "Upload the full member list and the survey file. The app returns a ZIP "
+        "with two Excel files: members who completed the survey, and members who did not."
+    )
+
+    col_a, col_b = st.columns(2)
+    members_file = col_a.file_uploader(
+        "Members CSV/XLSX", type=["csv", "xlsx", "xls"], key="split_members"
+    )
+    survey_file = col_b.file_uploader(
+        "Survey CSV/XLSX", type=["csv", "xlsx", "xls"], key="split_survey"
+    )
+    if not members_file or not survey_file:
+        return
+
+    try:
+        members_df = _read_table(members_file)
+    except Exception as e:
+        st.error(f"Could not read members file: {e}")
+        return
+    try:
+        survey_df = _read_table(survey_file)
+    except Exception as e:
+        st.error(f"Could not read survey file: {e}")
+        return
+
+    member_first = "First Name"
+    member_last = "Last Name"
+    member_email = "Top Ranked Email"
+    for col in (member_first, member_last, member_email):
+        if col not in members_df.columns:
+            st.error(f"Members file is missing the `{col}` column.")
+            return
+
+    survey_first = "Name"
+    survey_last = "Last"
+    survey_email = "Email"
+    for col in (survey_first, survey_last, survey_email):
+        if col not in survey_df.columns:
+            st.error(f"Survey file is missing the `{col}` column.")
+            return
+
+    def norm_email(v):
+        if pd.isna(v):
+            return ""
+        return str(v).strip().lower()
+
+    def norm_str(v):
+        if pd.isna(v):
+            return ""
+        return str(v).strip()
+
+    members = []
+    for i, row in members_df.iterrows():
+        members.append({
+            "idx": int(i),
+            "first": norm_str(row[member_first]),
+            "last": norm_str(row[member_last]),
+            "email": norm_email(row[member_email]),
+        })
+
+    respondents = []
+    for i, row in survey_df.iterrows():
+        respondents.append({
+            "idx": int(i),
+            "first": norm_str(row[survey_first]),
+            "last": norm_str(row[survey_last]),
+            "email": norm_email(row[survey_email]),
+        })
+
+    st.success(
+        f"Loaded {len(members):,} members and {len(respondents):,} survey respondents."
+    )
+
+    placeholder_emails = {"", "null@null.com"}
+    resp_emails = {r["email"] for r in respondents if r["email"] not in placeholder_emails}
+
+    email_matched = {
+        m["idx"] for m in members
+        if m["email"] and m["email"] not in placeholder_emails and m["email"] in resp_emails
+    }
+    st.info(f"{len(email_matched)} members matched by exact email; checking the rest by name.")
+
+    remaining = [m for m in members if m["idx"] not in email_matched]
+
+    if not api_key:
+        st.error(
+            "Server is missing the ANTHROPIC_API_KEY secret. "
+            "The app owner needs to set it in Streamlit Cloud → Settings → Secrets."
+        )
+        return
+
+    if not st.button("Split and download ZIP", type="primary"):
+        return
+
+    ai_matched = set()
+    usage = None
+    if remaining:
+        with st.spinner(f"Matching remaining members with {power_label}..."):
+            try:
+                results, usage = match_stewards_to_respondents(
+                    remaining, respondents, api_key, model
+                )
+            except anthropic.APIError as e:
+                st.error(f"Anthropic API error: {e}")
+                return
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+                return
+        ai_matched = {
+            r["steward_idx"] for r in results
+            if r["matched"] and r["confidence"] in ("high", "medium")
+        }
+
+    matched_idx = email_matched | ai_matched
+    completed_mask = members_df.index.isin(matched_idx)
+    completed_df = members_df.loc[completed_mask].copy()
+    missing_df = members_df.loc[~completed_mask].copy()
+
+    cols = st.columns(3)
+    cols[0].metric("Total members", len(members))
+    cols[1].metric("Completed survey", len(completed_df))
+    cols[2].metric("Did not complete", len(missing_df))
+
+    if usage is not None:
+        st.caption(
+            f"Tokens — input: {usage.input_tokens:,}, output: {usage.output_tokens:,}"
+        )
+
+    st.subheader("Members who completed the survey")
+    st.dataframe(completed_df, width="stretch")
+    st.subheader("Members who did NOT complete the survey")
+    st.dataframe(missing_df, width="stretch")
+
+    completed_buf = io.BytesIO()
+    with pd.ExcelWriter(completed_buf, engine="openpyxl") as writer:
+        completed_df.to_excel(writer, index=False, sheet_name="Completed Survey")
+    completed_buf.seek(0)
+
+    missing_buf = io.BytesIO()
+    with pd.ExcelWriter(missing_buf, engine="openpyxl") as writer:
+        missing_df.to_excel(writer, index=False, sheet_name="Did Not Complete")
+    missing_buf.seek(0)
+
+    base = members_file.name.rsplit(".", 1)[0]
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{base}-completed-survey.xlsx", completed_buf.getvalue())
+        zf.writestr(f"{base}-did-not-complete.xlsx", missing_buf.getvalue())
+    zip_buf.seek(0)
+
+    st.download_button(
+        "Download ZIP",
+        data=zip_buf,
+        file_name=f"{base}-survey-split.zip",
+        mime="application/zip",
+        type="primary",
+    )
+
+
 def main():
     st.set_page_config(page_title="UofT Bargaining Tools", layout="wide")
     st.title("UofT Bargaining Tools")
@@ -813,6 +992,7 @@ def main():
                 "Stewards didnt complete survey",
                 "Deduplicate by Name",
                 "Group by Department",
+                "Split members by survey completion",
             ],
             index=0,
         )
@@ -835,8 +1015,10 @@ def main():
         run_steward_audit(api_key, model, power_label)
     elif mode == "Deduplicate by Name":
         run_dedupe_by_name()
-    else:
+    elif mode == "Group by Department":
         run_group_by_department()
+    else:
+        run_split_members_by_survey(api_key, model, power_label)
 
 
 if __name__ == "__main__":
